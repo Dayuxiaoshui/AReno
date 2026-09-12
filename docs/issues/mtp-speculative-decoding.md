@@ -120,9 +120,84 @@ Performance (decode loop measured inside the worker; the client-side wall clock 
 
 Two defects found by the sweep are fixed: a single active row made the verify conv output a strided view that the recurrent kernel read as contiguous (garbage at B=1), and every verify CUDA graph bucket held its own KDA intermediate-state buffer (about 16 GB across buckets at 64 running rows); the buffer is now allocated once and shared.
 
-MTP layers are built only when a feature needs them: `EngineConfig` resolves `ModelConfig.mtp_layers_enabled` from `runtime.mtp_loss_scale` / `runtime.speculative_draft_tokens` (shared by the train and rollout partitions so policy-sync plans stay aligned), and reference / critic / reward roles never build them. Checkpoints saved from a model built without them omit the MTP head, which the model logs once at construction. Both knobs are exposed as `TrainerConfig.mtp_loss_scale`, `RolloutTrainerConfig.speculative_draft_tokens`, and the `--mtp-loss-scale` / `--speculative-draft-tokens` flags of `areno train`. Speculative mode captures only verify and draft graphs, and the stacked KDA caches plus the shared verify buffers are released by `clear_kv_caches` / `offload_kv_caches` so role switching does not leak HBM.
+MTP layers are built only when a feature needs them: `EngineConfig` resolves `ModelConfig.mtp_layers_enabled` from `runtime.mtp_loss_scale` / `runtime.speculative_draft_tokens` (shared by the train and rollout partitions so policy-sync plans stay aligned), and reference / critic / reward roles never build them. Checkpoints saved from a model built without them omit the MTP head, which the model logs once at construction. Both knobs are exposed as `TrainerConfig.mtp_loss_scale`, `RolloutTrainerConfig.speculative_draft_tokens`, and the `--mtp-loss-scale` / `--speculative-draft-tokens` flags of `areno train`. `areno serve` takes `--speculative-draft-tokens` as well and preflights it before starting workers (CUDA backend, flash attention, and a checkpoint with `num_nextn_predict_layers > 0`). Speculative mode captures only verify and draft graphs, and the stacked KDA caches plus the shared verify buffers are released by `clear_kv_caches` / `offload_kv_caches` so role switching does not leak HBM.
 
-Not done: native backend support, TP > 1 measurement, and an async scheduler to hide the host syncs.
+Not done: native backend support, speculative throughput at TP > 1 (TP=4 is
+verified functionally below, not benchmarked), and an async scheduler to hide the
+host syncs.
+
+## TP > 1: graph capture hardening
+
+A single-node 8-GPU MTP rollout killed every worker at the start of rollout. The
+capture path had two defects that produce exactly that, and both are specific to
+TP > 1 (they are harmless at TP = 1, where the feature was validated):
+
+- `_capture_graph` never guarded `DecodeGraph.warmup()`. An OOM while measuring
+  the working set propagated out of `infer_rollout` and took the worker down.
+- the capture-OOM fallback was rank-local. A captured graph contains the fused
+  MoE all-reduce, so a rank that skipped a bucket its peers captured (or that
+  ran the extra post-failure barrier) desynchronised the TP group's collective
+  sequence — one tight rank hangs or aborts all of them.
+
+Speculative mode makes hitting that path much more likely: it captures a verify
+graph plus one or two draft graphs per bucket (about 48 graphs for the 16
+default buckets) where plain decode captures 16, and each `torch.cuda.CUDAGraph`
+without an explicit pool keeps its own private memory pool alive for the graph's
+lifetime, so the cost is the sum over graphs rather than the largest one.
+
+The fix is an ordering rule: **`warmup()` and `capture()` both run the model, so
+the decision to attempt a bucket must be unanimous before either starts.** Each
+rank forms a local verdict with a collective-free probe (`mem_get_info` plus an
+actual trial allocation of the required block, because `mem_get_info` cannot see
+fragmentation), then one barrier and one MIN all-reduce (`agree_across_ranks`)
+settle it, and only then does every rank run the same warmup and capture. Skips
+log the rank, bucket, reason and free HBM. All graphs of a worker share one
+`torch.cuda.graph_pool_handle()`.
+
+Past that vote an OOM has no safe exit — the group's collectives are already in
+flight and a rank cannot drop out of them — so it raises a `RuntimeError` naming
+the rank and the knobs that make the run fit (`--max-running-prompts`,
+`runtime.decode_graph_buckets`, `runtime.speculative_draft_tokens`,
+`--eager-decode`) instead of hanging the group. An earlier version of this guard
+tried to recover there and deadlocked: py-spy showed ranks 0/2/3 parked in
+`warmup` while rank 1 waited in the vote's all-reduce.
+
+Measured at TP=4 on 4x H20 (94 GiB), Ling-3.0-tiny-base, `areno serve
+--speculative-draft-tokens 2`, one rank squeezed to 0.5 GiB free immediately
+after `offload_train_weights` (the window where capture runs):
+
+| | HEAD | with the fix |
+| --- | --- | --- |
+| clean run, 32 running prompts | verify=8 draft=16, no skips | verify=8 draft=16, no skips |
+| one rank squeezed | `rank 1 failed during Op.INFER_ROLLOUT`, `OutOfMemoryError` in `decode_graph.warmup()`, whole group torn down | all 4 ranks skip in lockstep (`verify=1 draft=0 skipped_buckets=7`), request completes on eager decode |
+
+The shared graph pool is worth less than a synthetic probe suggested: at 8
+running prompts (12 graphs) per-rank HBM is 9900 vs 10088 MiB, inside allocator
+noise; at 64 running prompts (36 graphs) it saves about 410 MiB/rank (22822 ->
+22412 MiB). It is kept because it is free and scales with graph count, not for
+the GiB-scale win a standalone 32-graph probe reported.
+
+Still unmeasured on hardware: an actual 8-GPU rollout (this box has 6 usable
+GPUs) and speculative throughput at TP > 1 — the runs above establish
+functionality and the capture protocol, not speedup. Also note the speculative
+sampler materialises full-vocab fp32 tensors (gathered logits, the top-p sort,
+and the persistent `(rows, k, vocab)` draft distributions) on *every* TP rank,
+where plain decode gathers to rank 0 only; verifying on rank 0 and broadcasting
+would cut that per-rank peak.
+
+## Pre-existing: `areno serve` sizes KV for the checkpoint's full context
+
+Unrelated to MTP, but it produces the same "all workers die at the start of
+rollout" symptom and was hit repeatedly while testing the above. The serve path
+sizes the KV cache from the checkpoint's `max_position_embeddings`
+(`areno/engine/api.py:452-468`): `max_cache_len` is the longest
+prompt + `max_new_tokens` or `rollout_max_cache_len`, and `num_blocks` is
+`local_max_running_prompts * ceil_div(max_cache_len, kv_block_size)`. For
+Ling-3.0-tiny-base that context is 262144 tokens, so `allocate_kv_caches` asks
+for a 12.01 GiB tensor per softmax-attention layer and dies before any graph is
+captured — with or without `--speculative-draft-tokens`. Testing here used a
+config copy with `max_position_embeddings=8192`; no source change was made,
+since capping serve's KV budget touches the CLI/config surface.
 
 ## Related fix found during the study
 

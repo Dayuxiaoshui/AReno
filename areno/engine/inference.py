@@ -28,7 +28,8 @@ from areno.engine.protocol import RolloutPayload
 from areno.engine.runtime.common import _check_token_ids, _device_long, ceil_div
 from areno.engine.runtime.decode_graph import (
     DecodeGraph,
-    has_graph_capture_memory,
+    agree_across_ranks,
+    graph_capture_headroom,
     sync_before_graph_capture,
 )
 from areno.engine.runtime.metadata import InferMeta
@@ -83,6 +84,12 @@ def _graph_for_rows(graphs: dict[int, DecodeGraph], rows: int) -> DecodeGraph | 
         if bucket >= rows:
             return graphs[bucket]
     return None
+
+
+def _first_line(exc: BaseException) -> str:
+    """First line of an exception message; CUDA OOM messages are a paragraph."""
+
+    return str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
 
 
 def _prefill_next_input_ids(state: InferenceBatchState, raw: dict) -> torch.Tensor:
@@ -230,6 +237,8 @@ class InferenceManager:
             self._draft_graphs.clear()
             self._decode_graph_skipped_buckets.clear()
             self._decode_graph_init_attempted = False
+            self._decode_graph_pool = None
+            self._decode_graph_warmup_peak = 0
         self._infer_batch_size = max_running_seqs
         # Recurrent models need their own scratch slot for CUDA-graph warmup,
         # capture, and padded replay rows.  Real requests exclusively own
@@ -247,6 +256,8 @@ class InferenceManager:
         self._draft_graphs.clear()
         self._decode_graph_skipped_buckets.clear()
         self._decode_graph_init_attempted = False
+        self._decode_graph_pool = None
+        self._decode_graph_warmup_peak = 0
         self._infer_cache_spec = (
             max_running_seqs,
             num_blocks,
@@ -1554,8 +1565,22 @@ class InferenceManager:
                 self._decode_graph_skipped_buckets.add(bucket)
                 continue
             self._decode_graphs[bucket] = graph
+        if get_tp_context().is_rank0:
+            free_bytes, _ = torch.cuda.mem_get_info(self.device)
+            logger.info(
+                "decode CUDA graphs ready: decode=%d verify=%d draft=%d skipped_buckets=%d free_gib=%.2f",
+                len(self._decode_graphs),
+                len(self._verify_graphs),
+                len(self._draft_graphs),
+                len(self._decode_graph_skipped_buckets),
+                free_bytes / (1024**3),
+            )
 
     def _new_decode_graph(self, bucket: int, **kwargs) -> DecodeGraph:
+        if self._decode_graph_pool is None:
+            # One private memory pool for every graph this worker captures, so
+            # the graphs share their working set instead of each reserving one.
+            self._decode_graph_pool = torch.cuda.graph_pool_handle()
         return DecodeGraph(
             self.model,
             bucket,
@@ -1564,6 +1589,7 @@ class InferenceManager:
             self._scratch_recurrent_slot,
             self.device,
             capture_routing=self.config.runtime.rollout_routing_replay,
+            graph_pool=self._decode_graph_pool,
             **kwargs,
         )
 
@@ -1587,41 +1613,70 @@ class InferenceManager:
                 self._draft_graphs[(bucket, tokens_per_seq)] = draft
 
     def _capture_graph(self, graph: DecodeGraph, label: str) -> bool:
-        """Warm up, vote on memory across ranks, and capture; False means fall back to eager."""
+        """Agree across ranks whether to attempt this bucket, then warm up and capture it.
+
+        `warmup()` and `capture()` both run the model, whose fused MoE layer
+        all-reduces over the TP group, so the decision has to be unanimous
+        *before* either of them starts. A rank that decided on its own to skip
+        would leave its peers inside the warmup's collective while it waited for
+        them in the next vote — that deadlocks all of them, and it is what an
+        earlier version of this guard did at TP=4. So: a collective-free local
+        probe, one vote, then every rank does the same thing. False means the
+        whole group skipped the bucket and it decodes eagerly.
+
+        Once the group has voted to go, an OOM has no safe exit: the model's
+        collectives are already in flight and a rank cannot drop out of them.
+        It raises instead, with the knobs that make the run fit.
+        """
 
         ctx = get_tp_context()
-        # Warmup: run a few eager forwards at this bucket size to (a) trim
-        # compiler / allocator noise and (b) measure the working-set peak
-        # we need free at capture time.
-        warmup_bytes = graph.warmup()
+        # The largest working set measured so far is the best estimate of what
+        # this bucket needs. Probing for it costs no collective, so it is the
+        # only place a rank may form its own opinion.
+        estimate = self._decode_graph_warmup_peak
+        headroom, free_bytes = graph_capture_headroom(self.device, estimate)
         sync_before_graph_capture(self.device, ctx.group)
-        # All ranks vote on whether HBM headroom exists; any rank tight on
-        # memory aborts the whole bucket so no rank is left half-captured.
-        if not has_graph_capture_memory(self.device, ctx.group, warmup_bytes):
-            if ctx.is_rank0:
-                free_bytes, _ = torch.cuda.mem_get_info(self.device)
-                logger.info(
-                    "skipping CUDA graph capture: %s free_gib=%.2f warmup_peak_gib=%.2f",
-                    label,
-                    free_bytes / (1024**3),
-                    warmup_bytes / (1024**3),
-                )
-            sync_before_graph_capture(self.device, ctx.group)
+        if not agree_across_ranks(self.device, ctx.group, headroom):
+            self._log_graph_skip(label, headroom, free_bytes, estimate)
             return False
+        reserved_before = torch.cuda.memory_reserved(self.device)
         try:
+            # Warmup runs a few eager forwards at this bucket size to trim
+            # allocator/compiler noise and to measure the working-set peak the
+            # next bucket's probe needs.
+            self._decode_graph_warmup_peak = max(estimate, graph.warmup())
             graph.capture()
-        except torch.OutOfMemoryError:
-            # Capture itself can still OOM (extra workspace allocations);
-            # in that case fall back to eager for this bucket and move on.
-            if self.device.type == "cuda":
-                torch.cuda.empty_cache()
-            if ctx.is_rank0:
-                free_bytes, _ = torch.cuda.mem_get_info(self.device)
-                logger.warning(
-                    "skipping CUDA graph capture after OOM: %s free_gib=%.2f fallback=eager",
-                    label,
-                    free_bytes / (1024**3),
-                )
-            sync_before_graph_capture(self.device, ctx.group)
-            return False
+        except torch.OutOfMemoryError as exc:
+            torch.cuda.empty_cache()
+            raise RuntimeError(
+                f"out of memory while capturing the decode CUDA graph for {label} on rank {ctx.rank}: "
+                f"{_first_line(exc)}. The TP group already committed to this bucket, so no rank can skip it "
+                "without hanging the others; the run stops here instead. Lower --max-running-prompts, reduce "
+                "runtime.decode_graph_buckets, lower runtime.speculative_draft_tokens, or pass --eager-decode."
+            ) from exc
+        logger.debug(
+            "captured CUDA graph: %s pool_gib=%.2f free_gib=%.2f",
+            label,
+            max(0, torch.cuda.memory_reserved(self.device) - reserved_before) / (1024**3),
+            free_bytes / (1024**3),
+        )
         return True
+
+    def _log_graph_skip(self, label: str, local_ok: bool, free_bytes: int, estimate: int) -> None:
+        """Report a skipped bucket on the rank that caused it, plus once on rank 0."""
+
+        ctx = get_tp_context()
+        if local_ok and not ctx.is_rank0:
+            return
+        reason = (
+            "another rank had too little free HBM"
+            if local_ok
+            else f"free HBM is below the {estimate / (1024**3):.2f} GiB working set measured for earlier graphs"
+        )
+        logger.warning(
+            "skipping CUDA graph capture, falling back to eager decode: %s rank=%d reason=%s free_gib=%.2f",
+            label,
+            ctx.rank,
+            reason,
+            free_bytes / (1024**3),
+        )

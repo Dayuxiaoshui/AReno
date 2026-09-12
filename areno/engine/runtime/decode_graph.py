@@ -48,20 +48,46 @@ def sync_before_graph_capture(device: torch.device, group) -> None:
         torch.cuda.synchronize(device)
 
 
-def has_graph_capture_memory(device: torch.device, group, warmup_bytes: int) -> bool:
-    """Return true only if every rank has enough free memory for capture."""
+def agree_across_ranks(device: torch.device, group, local_ok: bool) -> bool:
+    """Return true only when every rank in `group` passes `local_ok`.
+
+    Capture decisions must be unanimous: a captured graph contains the MoE
+    all-reduce, so a rank that keeps a bucket its peers skipped would launch a
+    collective nobody joins and hang the whole group. Callers vote here instead
+    of acting on their own verdict.
+    """
+    if not (dist.is_available() and dist.is_initialized()):
+        return local_ok
+    vote = torch.tensor([1 if local_ok else 0], device=device if device.type == "cuda" else "cpu", dtype=torch.int32)
+    # MIN reduce so the result is true only when EVERY rank is happy.
+    dist.all_reduce(vote, op=dist.ReduceOp.MIN, group=group)
+    return bool(vote.item())
+
+
+def graph_capture_headroom(device: torch.device, warmup_bytes: int) -> tuple[bool, int]:
+    """Return `(has_headroom, free_bytes)` for capturing a graph on this rank.
+
+    This runs no collective, which is what lets it be the one place a rank
+    forms its own verdict before the group votes. It has to be conservative:
+    once the vote passes, warmup and capture run the model's collectives and an
+    OOM there is fatal for the whole group.
+    """
     if device.type != "cuda":
-        return True
+        return True, 0
     free_bytes, _ = torch.cuda.mem_get_info(device)
     # Capture itself adds bookkeeping over the warmup peak, so demand a 20%
     # headroom margin before letting any rank start to capture.
     required = int(max(warmup_bytes, 1) * 1.2)
-    ok = torch.tensor([1 if free_bytes > required else 0], device=device, dtype=torch.int32)
-    # MIN reduce so the result is true only when EVERY rank is happy; one
-    # tight rank causes all ranks to skip capture in lockstep.
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=group)
-    return bool(ok.item())
+    if free_bytes <= required:
+        return False, free_bytes
+    try:
+        # `mem_get_info` reports free device memory, not memory the caching
+        # allocator can actually hand out in one piece; ask it for the block.
+        probe = torch.empty(required, dtype=torch.uint8, device=device)
+    except torch.OutOfMemoryError:
+        return False, free_bytes
+    del probe
+    return True, free_bytes
 
 
 class DecodeGraph:
@@ -85,12 +111,23 @@ class DecodeGraph:
         tokens_per_seq: int = 1,
         draft_hidden_size: int | None = None,
         hidden_dtype: torch.dtype = torch.bfloat16,
+        graph_pool=None,
     ):
         """Allocate static input buffers and the `InferMeta` baked into capture."""
 
         self.model = model
         self.bucket = bucket
         self.tokens_per_seq = tokens_per_seq
+        # Handle from `torch.cuda.graph_pool_handle()`, shared by every graph of
+        # a worker: without it each capture gets a private memory pool that
+        # keeps its whole working set reserved for the graph's lifetime, so the
+        # cost is the *sum* over graphs instead of the largest one. Speculative
+        # decoding captures three graphs per bucket, which makes that difference
+        # several GB. Sharing is safe because the allocator never hands a block
+        # that is still referenced (each graph's output tensors stay alive) to a
+        # later capture, and the decode loop reads a graph's outputs before
+        # replaying another graph.
+        self.graph_pool = graph_pool
         self.scratch_block = scratch_block
         self.scratch_recurrent_slot = scratch_recurrent_slot
         self.device = device
@@ -167,7 +204,8 @@ class DecodeGraph:
         # All inputs referenced here must already live on the graph's stream
         # and must remain alive at the same addresses for the lifetime of the
         # graph, which is exactly what `self.input_ids/...` provide.
-        with torch.cuda.device(self.device), torch.cuda.graph(self.graph):
+        pool = {} if self.graph_pool is None else {"pool": self.graph_pool}
+        with torch.cuda.device(self.device), torch.cuda.graph(self.graph, **pool):
             with routing_replay_context(self.meta):
                 self.logits_shard, self.output_hidden = self._forward()
             # Stack per-layer routes while capture is active. Replay then
