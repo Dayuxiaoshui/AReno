@@ -224,6 +224,156 @@ def test_mlx_backend_uses_default_config_before_loading_provider(monkeypatch):
     assert backend.config == MlxConfig()
 
 
+def test_mlx_backend_forwards_legacy_native_adapter_path(monkeypatch):
+    from areno.api.backend.mlx.backend import MlxBackend
+    from areno.api.config import MlxConfig
+
+    mlx_module = ModuleType("mlx")
+    mlx_core_module = ModuleType("mlx.core")
+    mlx_module.core = mlx_core_module
+    monkeypatch.setitem(sys.modules, "mlx", mlx_module)
+    monkeypatch.setitem(sys.modules, "mlx.core", mlx_core_module)
+
+    class ProviderLoadReached(Exception):
+        pass
+
+    def load_provider(model_path, *, adapter_path=None):
+        assert model_path == "model"
+        assert adapter_path == "mlx-native-adapter"
+        raise ProviderLoadReached
+
+    monkeypatch.setattr("areno.api.backend.mlx.backend.load_provider", load_provider)
+    config = MlxConfig(adapter_path="mlx-native-adapter")
+    backend = MlxBackend()
+    ctx = SimpleNamespace(world_size=1, custom_config=config, model_path="model")
+
+    with pytest.raises(ProviderLoadReached):
+        backend.initialize(ctx)
+
+    assert backend.config is config
+
+
+def test_mlx_backend_injects_peft_lora_before_building_optimizer(monkeypatch):
+    from areno.adapters import LoraConfig
+    from areno.api.backend.mlx.backend import MlxBackend
+    from areno.api.config import MlxConfig
+
+    events = []
+    mlx_module = ModuleType("mlx")
+    mlx_core_module = ModuleType("mlx.core")
+    mlx_core_module.metal = SimpleNamespace(is_available=lambda: False)
+    mlx_core_module.eval = lambda *args: events.append("eval")
+    mlx_module.core = mlx_core_module
+    monkeypatch.setitem(sys.modules, "mlx", mlx_module)
+    monkeypatch.setitem(sys.modules, "mlx.core", mlx_core_module)
+
+    class FakeTokenizer:
+        def encode(self, text, *, add_special_tokens):
+            del text, add_special_tokens
+            return [1, 2, 3]
+
+    class FakeModel:
+        def parameters(self):
+            return {}
+
+        def train(self):
+            events.append("train")
+
+    model = FakeModel()
+    tokenizer = FakeTokenizer()
+    provider = SimpleNamespace(
+        model=model,
+        tokenizer=tokenizer,
+        processor=None,
+        config={"model_type": "qwen3"},
+        is_multimodal=False,
+        optimizer_state_precision=lambda path, parameter: "8bit",
+    )
+    lora_state = object()
+    optimizer = SimpleNamespace(state={})
+
+    def load_provider(model_path, *, adapter_path=None):
+        assert model_path == "model"
+        assert adapter_path is None
+        events.append("load_provider")
+        return provider
+
+    def inject(model_arg, config_arg, *, model_type):
+        assert model_arg is model
+        assert config_arg is config.lora
+        assert model_type == "qwen3"
+        events.append("initialize_lora")
+        return lora_state
+
+    def make_optimizer(optimizer_config, *, state_precision_for_parameter):
+        assert optimizer_config == {}
+        assert state_precision_for_parameter is provider.optimizer_state_precision
+        events.append("build_optimizer")
+        return optimizer, [("model", optimizer, {})]
+
+    monkeypatch.setattr("areno.api.backend.mlx.backend.load_provider", load_provider)
+    monkeypatch.setattr("areno.api.backend.mlx.backend.initialize_lora", inject)
+    monkeypatch.setattr("areno.api.backend.mlx.backend.build_optimizer", make_optimizer)
+    config = MlxConfig(lora=LoraConfig(), gradient_checkpointing=False)
+    backend = MlxBackend()
+    ctx = SimpleNamespace(
+        world_size=1,
+        custom_config=config,
+        model_path="model",
+        tokenizer=tokenizer,
+    )
+
+    backend.initialize(ctx)
+
+    assert events[:3] == ["load_provider", "initialize_lora", "build_optimizer"]
+    assert backend._lora_state is lora_state
+
+
+def test_mlx_backend_saves_and_exports_lora_as_peft(monkeypatch):
+    from areno.adapters import LoraConfig
+    from areno.api.backend.mlx.backend import MlxBackend
+    from areno.api.config import MlxConfig
+
+    calls = []
+    lora_state = object()
+
+    def export(state, path, *, base_model_name_or_path):
+        calls.append((state, path, base_model_name_or_path))
+        return path
+
+    monkeypatch.setattr("areno.api.backend.mlx.backend.export_peft_adapter", export)
+    backend = MlxBackend()
+    backend.provider = SimpleNamespace()
+    backend.model = SimpleNamespace()
+    backend.tokenizer = SimpleNamespace()
+    backend.optimizer = SimpleNamespace()
+    backend.config = MlxConfig(base_model_name_or_path="Qwen/Qwen3-0.6B", lora=LoraConfig())
+    backend._lora_state = lora_state
+    ctx = SimpleNamespace(model_path="resolved-model", global_step=2)
+
+    assert backend.save_checkpoint(ctx, "checkpoint") == "checkpoint"
+    assert backend.export_adapter(ctx, "manual-adapter") == "manual-adapter"
+    assert calls == [
+        (lora_state, "checkpoint", "Qwen/Qwen3-0.6B"),
+        (lora_state, "manual-adapter", "Qwen/Qwen3-0.6B"),
+    ]
+
+
+def test_mlx_backend_export_adapter_requires_lora():
+    from areno.api.backend.mlx.backend import MlxBackend
+    from areno.api.config import MlxConfig
+
+    backend = MlxBackend()
+    backend.provider = SimpleNamespace()
+    backend.model = SimpleNamespace()
+    backend.tokenizer = SimpleNamespace()
+    backend.optimizer = SimpleNamespace()
+    backend.config = MlxConfig()
+
+    with pytest.raises(RuntimeError, match="requires MLX LoRA"):
+        backend.export_adapter(SimpleNamespace(model_path="model"), "adapter")
+
+
 def test_adam8bit_lazy_state_remains_stable_after_zero_gradient_steps():
     mx = pytest.importorskip("mlx.core")
     nn = pytest.importorskip("mlx.nn")
@@ -285,3 +435,63 @@ def test_adam8bit_matches_bias_corrected_adamw_for_uniform_moments():
         mx.eval(reference_model.parameters(), quantized_model.parameters())
 
     assert bool(mx.allclose(reference_model.weight, quantized_model.weight, atol=2e-5, rtol=2e-5).item())
+
+
+def test_adam8bit_dynamic_codebooks_match_cuda_reference():
+    mx = pytest.importorskip("mlx.core")
+
+    from areno.api.backend.mlx.optimizer import _mlx_dynamic_codebook
+    from areno.engine.optim.dynamic_quant import SIGNED_DYNAMIC_MAP, UNSIGNED_DYNAMIC_MAP
+
+    _require_mlx_device(mx)
+    signed = _mlx_dynamic_codebook(signed=True)
+    unsigned = _mlx_dynamic_codebook(signed=False)
+    mx.eval(signed, unsigned)
+
+    np.testing.assert_array_equal(np.array(signed), np.asarray(SIGNED_DYNAMIC_MAP, dtype=np.float32))
+    np.testing.assert_array_equal(np.array(unsigned), np.asarray(UNSIGNED_DYNAMIC_MAP, dtype=np.float32))
+
+
+def test_adam8bit_mlx_precision_callback_keeps_fp32_moments():
+    mx = pytest.importorskip("mlx.core")
+    nn = pytest.importorskip("mlx.nn")
+    from mlx.utils import tree_flatten, tree_unflatten
+
+    from areno.api.backend.mlx.optimizer import _quantized_adamw_class, apply_optimizer_update
+
+    _require_mlx_device(mx)
+    model = nn.Linear(8, 2, bias=False)
+    optimizer = _quantized_adamw_class()(
+        learning_rate=1e-3,
+        weight_decay=0.0,
+        state_precision_for_parameter=lambda _path, _parameter: "fp32",
+    )
+    path = tree_flatten(model.trainable_parameters())[0][0]
+    gradient = mx.ones_like(model.weight)
+    apply_optimizer_update(model, optimizer, tree_unflatten([(path, gradient)]))
+    state_names = {name for name, _ in tree_flatten(optimizer.state)}
+
+    assert any(name.endswith("m") for name in state_names)
+    assert any(name.endswith("v") for name in state_names)
+    assert not any(name.endswith(("m_q", "v_q", "m_scale", "v_scale")) for name in state_names)
+
+
+def test_mlx_provider_routes_embedding_by_identity_without_path_matching():
+    from areno.api.backend.mlx.provider import MlxModelProvider
+
+    embedding_weight = object()
+    per_layer_weight = object()
+    ordinary_weight = object()
+    embedding = SimpleNamespace(weight=embedding_weight)
+    per_layer_embedding = SimpleNamespace(weight=per_layer_weight)
+    model = SimpleNamespace(
+        model=SimpleNamespace(
+            embed_tokens=embedding,
+            embed_tokens_per_layer=[per_layer_embedding],
+        )
+    )
+    provider = MlxModelProvider(model, tokenizer=None, processor=None, config={})
+
+    assert provider.optimizer_state_precision("unexpected.path", embedding_weight) == "fp32"
+    assert provider.optimizer_state_precision("another.unexpected.path", per_layer_weight) == "fp32"
+    assert provider.optimizer_state_precision("embed_tokens.lookalike", ordinary_weight) == "8bit"
