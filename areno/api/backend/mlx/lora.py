@@ -135,6 +135,8 @@ def initialize_lora(
 ) -> MlxLoraState:
     """Validate a model family's projections, freeze the base and inject LoRA."""
 
+    if config.lora_fa:
+        raise ValueError("LoRA-FA (lora_fa=True) is not supported on the MLX backend")
     resolver = _TARGET_RESOLVERS.get(model_type, _decoder_targets)
 
     requested = set(config.target_modules)
